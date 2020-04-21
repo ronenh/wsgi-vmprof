@@ -1,10 +1,11 @@
+import gc
 import os
+import platform
 import sys
 import tempfile
 
 import vmprof
-from vmprof.upload import upload as upload_vmprofile
-from jitlog.parser import parse_jitlog
+from vmshare.service import Service
 
 try:
     import _jitlog
@@ -12,38 +13,47 @@ except ImportError:
     _jitlog = None
 
 
-OUTPUT_CLI = 'cli'
-OUTPUT_WEB = 'web'
-OUTPUT_FILE = 'file'
+OUTPUT_CLI = "cli"
+OUTPUT_WEB = "web"
+OUTPUT_FILE = "file"
 
 
-def upload_stats(stats, forest, web_url, web_auth):
-    name = ""  # No name because vmprof is run in wsgi application.
-    argv = ""  # No arguments because vmprof is run by middleware. (It's not CLI!)
-    host = web_url
-    auth = web_auth
+def upload_stats(filename, web_url, web_auth):
     sys.stderr.write("Compiling and uploading to {}...\n".format(web_url))
-    upload_vmprofile(stats, name, argv, host, auth, forest)
+    service = Service(web_url, web_auth)
+    service.post(
+        {
+            Service.FILE_CPU_PROFILE: filename,
+            Service.FILE_JIT_PROFILE: filename + ".jit",
+            "VM": platform.python_implementation(),
+        }
+    )
 
 
 def show_stats(filename, output_mode, web_url, web_auth):
     if output_mode == OUTPUT_FILE:
         return
 
-    stats = vmprof.read_profile(filename)
-    forest = None
-
     if output_mode == OUTPUT_CLI:
+        stats = vmprof.read_profile(filename)
         vmprof.cli.show(stats)
     elif output_mode == OUTPUT_WEB:
-        upload_stats(stats, forest, web_url, web_auth)
+        upload_stats(filename, web_url, web_auth)
 
 
 class VmprofMiddleware:
-    def __init__(self, app,
-                 period=0.001,
-                 web_url='http://vmprof.com', web_auth=None, mem=False, lines=False, jitlog=False,
-                 web=None, output=None):
+    def __init__(
+        self,
+        app,
+        period=0.001,
+        web_url="http://vmprof.com",
+        web_auth=None,
+        mem=False,
+        lines=False,
+        jitlog=False,
+        web=None,
+        output=None,
+    ):
         """
         Parameter details are here:
             https://github.com/vmprof/vmprof-python/blob/master/vmprof/cli.py#L7-L72
@@ -64,35 +74,47 @@ class VmprofMiddleware:
         self.period = period
         self.mem = mem
         self.lines = lines
+        self.jitlog = jitlog
 
         if web:
             self.output_mode = OUTPUT_WEB
         elif output:
             self.output_mode = OUTPUT_FILE
+            self.prof_name = output
         else:
             self.output_mode = OUTPUT_CLI
 
+    def start(self):
         if self.output_mode == OUTPUT_FILE:
-            self.prof_name = output
-            self.prof_file = open(self.prof_name, 'w+b')
+            self.prof_file = open(self.prof_name, "w+b")
         else:
             self.prof_file = tempfile.NamedTemporaryFile(delete=False)
             self.prof_name = self.prof_file.name
 
-        if jitlog and _jitlog:
-            fd = os.open(self.prof_file + '.jitlog',
-                         os.O_WRONLY | os.O_TRUNC | os.O_CREAT)
-            _jitlog.enable(fd)
-
-    def start(self):
+        if self.jitlog and _jitlog:
+            self.jitlog_fd = os.open(
+                self.prof_file + ".jitlog", os.O_WRONLY | os.O_TRUNC | os.O_CREAT
+            )
+            _jitlog.enable(self.jitlog_fd)
         vmprof.enable(self.prof_file.fileno(), self.period, self.mem, self.lines)
 
     def stop(self):
         vmprof.disable()
         self.prof_file.close()
-        show_stats(self.prof_name, self.output_mode, web_url=self.web_url, web_auth=self.web_auth)
+        show_stats(
+            self.prof_name,
+            self.output_mode,
+            web_url=self.web_url,
+            web_auth=self.web_auth,
+        )
         if self.output_mode != OUTPUT_FILE:
             os.unlink(self.prof_name)
 
     def __call__(self, *args, **kwargs):
-        return self.app(*args, **kwargs)
+        try:
+            self.start()
+            gc.disable()
+            return self.app(*args, **kwargs)
+        finally:
+
+            self.stop()
